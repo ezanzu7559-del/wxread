@@ -1,0 +1,60 @@
+name: wxread-backup
+
+# 看门狗：一天四个时点检查「今天有没有成功阅读」，没有则自动触发补跑
+# 原理：GitHub 高峰期会随机丢弃定时任务（官方已知行为），此工作流提供冗余兜底
+# 每天仍只读一次书：已有成功记录或正在运行时会自动跳过
+
+concurrency:
+  group: wxread-backup
+  cancel-in-progress: false
+
+on:
+  schedule:
+    # 北京时间每天 05:03（UTC 前一天 21:03）
+    - cron: '3 21 * * *'
+    # 北京时间每天 11:43（UTC 03:43）
+    - cron: '43 3 * * *'
+    # 北京时间每天 17:43（UTC 09:43）
+    - cron: '43 9 * * *'
+    # 北京时间每天 22:03（UTC 14:03）
+    - cron: '3 14 * * *'
+  workflow_dispatch:  # 支持手动检查
+
+permissions:
+  actions: write  # 允许触发同仓库的 deploy.yml
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查今日阅读任务并按需补跑
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVERCHAN_SPT: ${{ secrets.SERVERCHAN_SPT }}
+        run: |
+          set -eu
+          REPO="${GITHUB_REPOSITORY}"
+
+          # 北京时间今天零点对应的时间戳（按北京自然日判断"今天"）
+          cutoff=$(TZ=Asia/Shanghai date -d "$(TZ=Asia/Shanghai date +%Y-%m-%dT00:00:00)" +%s)
+          echo "北京时间今日零点 = epoch ${cutoff}"
+
+          runs=$(gh api "repos/${REPO}/actions/workflows/deploy.yml/runs?per_page=50")
+          done_today=$(echo "$runs" | jq --argjson cutoff "${cutoff}" '[.workflow_runs[] | select(((.created_at | fromdateiso8601) >= $cutoff) and (.conclusion == "success"))] | length')
+          active=$(echo "$runs" | jq --argjson cutoff "${cutoff}" '[.workflow_runs[] | select(((.created_at | fromdateiso8601) >= $cutoff) and (.status == "in_progress" or .status == "queued"))] | length')
+          echo "今日成功阅读次数: ${done_today}，进行中/排队: ${active}"
+
+          if [ "${done_today}" -gt 0 ] || [ "${active}" -gt 0 ]; then
+            echo "今天已有阅读记录或正在运行，无需补跑。"
+            exit 0
+          fi
+
+          echo "今天没有任何成功阅读记录，触发补跑……"
+          gh api "repos/${REPO}/actions/workflows/deploy.yml/dispatches" -f ref=main
+
+          # 通过 ServerChan 通知用户（与本仓库推送渠道一致）
+          if [ -n "${SERVERCHAN_SPT}" ]; then
+            curl -s -m 10 "https://sctapi.ftqq.com/${SERVERCHAN_SPT}.send" \
+              -d "title=微信读书-自动补跑" \
+              -d "desp=今天的定时任务被 GitHub 丢弃了，看门狗已自动触发补跑，预计 30 多分钟后完成。" > /dev/null || true
+          fi
